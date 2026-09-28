@@ -1,2 +1,2 @@
-// Package goservicedrain provides the starting point for the task.
+// Package goservicedrain 的包级总览见 coordinator.go。
 package goservicedrain
