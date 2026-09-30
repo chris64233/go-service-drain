@@ -295,17 +295,19 @@ func (c *Coordinator) CloseSession(instanceID, sessionID string, version int64) 
 	// The state guard makes a racing second close/timeout unable to complete
 	// the drain twice.
 	if inst.state == StateDraining && len(inst.sessions) == 1 {
-		changes = append(changes, c.naturalCompletionChange(inst))
+		changes = append(changes, c.naturalCompletionChange(inst, inst.version))
 	}
 	return c.commit(changes...)
 }
 
 // naturalCompletionChange builds the drain_completed change (reason drained)
-// and its state transition. The caller must hold c.mu and have already
-// established that the session map will be empty once the batch applies.
-func (c *Coordinator) naturalCompletionChange(inst *instance) journaledChange {
+// and its state transition. drainID is the version of the drain being
+// completed; callers must pass it explicitly because the instance's version
+// field is only updated when the batch applies. The caller must hold c.mu and
+// have already established that the session map will be empty once the batch
+// applies.
+func (c *Coordinator) naturalCompletionChange(inst *instance, drainID int64) journaledChange {
 	at := c.clock.Now()
-	drainID := inst.version
 	payload := &evDrainCompleted{
 		InstanceID: inst.id,
 		DrainID:    drainID,
@@ -385,7 +387,7 @@ func (c *Coordinator) BeginDrain(instanceID string, forceAfter time.Duration) (v
 		},
 	}}
 	if len(ids) == 0 {
-		changes = append(changes, c.naturalCompletionChange(inst))
+		changes = append(changes, c.naturalCompletionChange(inst, newVersion))
 	}
 	if err := c.commit(changes...); err != nil {
 		return 0, time.Time{}, err
@@ -490,7 +492,7 @@ func (c *Coordinator) advanceLocked(now time.Time) error {
 		// 2. Every session is gone after the lease-expiry removals above ->
 		//    the drain completes naturally.
 		if len(inst.sessions)-len(expired) == 0 {
-			changes = append(changes, c.naturalCompletionChange(inst))
+			changes = append(changes, c.naturalCompletionChange(inst, inst.version))
 			continue
 		}
 

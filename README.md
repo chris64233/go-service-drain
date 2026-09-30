@@ -44,7 +44,9 @@
 | `BeginDrain(instanceID, forceAfter)` | 发起摘流，返回新版本与强制截止时间；无会话时立即完成 |
 | `CancelDrain(instanceID, version)` | 截止前取消摘流并恢复接流 |
 | `ProcessTimeouts()` | 按协调器时钟推进：租约过期、强制终止 |
+| `Advance(now)` | 以指定时间推进超时处理（配合固定时钟的测试） |
 | `Status(instanceID)` | 查询状态、版本、活动会话数及租约明细 |
+| `Completions()` | 读取全部摘流完成通知（每次摘流至多一条） |
 
 ## 持久化
 

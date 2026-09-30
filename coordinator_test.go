@@ -210,7 +210,7 @@ func TestBeginDrainWithNoSessionsCompletesImmediately(t *testing.T) {
 		t.Fatalf("state = %s, want drained", st.State)
 	}
 	comps := c.Completions()
-	if len(comps) != 1 || comps[0].Reason != ReasonDrained {
+	if len(comps) != 1 || comps[0].Reason != ReasonDrained || comps[0].DrainID != version {
 		t.Fatalf("completions = %+v", comps)
 	}
 }
@@ -400,6 +400,9 @@ func TestLateCancelCannotUndoNewerDrain(t *testing.T) {
 	st, _ := c.Status("inst")
 	if st.State != StateDrained || st.Version != 2 {
 		t.Fatalf("status = %+v", st)
+	}
+	if comps := c.Completions(); len(comps) != 1 || comps[0].DrainID != 2 {
+		t.Fatalf("completions = %+v", comps)
 	}
 
 	if err := c.CancelDrain("inst", v1); !errors.Is(err, ErrInstanceDrained) {
