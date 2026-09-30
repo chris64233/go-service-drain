@@ -328,6 +328,74 @@ func TestHeartbeatPreventsExpiry(t *testing.T) {
 	}
 }
 
+// A heartbeat that arrives after its session was already closed (reordered
+// delivery) must not recreate the lease or move the active count.
+func TestHeartbeatAfterCloseIsIgnored(t *testing.T) {
+	c, clock := newTestCoordinator(t)
+	_ = c.Register("inst")
+	l, _ := c.AcquireSession("inst", time.Minute)
+
+	if err := c.CloseSession("inst", l.SessionID, l.Version); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	if _, err := c.Heartbeat("inst", l.SessionID, l.Version, time.Minute); !errors.Is(err, ErrLeaseUnknown) {
+		t.Fatalf("heartbeat after close = %v, want ErrLeaseUnknown", err)
+	}
+	st, _ := c.Status("inst")
+	if st.ActiveSessions != 0 || len(st.Sessions) != 0 {
+		t.Fatalf("heartbeat resurrected a closed session: %+v", st)
+	}
+
+	// Same for a heartbeat arriving after the lease expired on its own.
+	l2, _ := c.AcquireSession("inst", 5*time.Second)
+	clock.Advance(5 * time.Second)
+	if err := c.ProcessTimeouts(); err != nil {
+		t.Fatalf("ProcessTimeouts: %v", err)
+	}
+	if _, err := c.Heartbeat("inst", l2.SessionID, l2.Version, time.Minute); !errors.Is(err, ErrLeaseUnknown) {
+		t.Fatalf("heartbeat after expiry = %v, want ErrLeaseUnknown", err)
+	}
+	if st, _ := c.Status("inst"); st.ActiveSessions != 0 {
+		t.Fatalf("heartbeat resurrected an expired session: %+v", st)
+	}
+}
+
+// Lease expiry on an active (non-draining) instance simply drops the session:
+// the instance keeps accepting traffic and no drain completion is produced.
+func TestLeaseExpiryOnActiveInstance(t *testing.T) {
+	c, clock := newTestCoordinator(t)
+	_ = c.Register("inst")
+	l1, _ := c.AcquireSession("inst", 5*time.Second)
+	l2, _ := c.AcquireSession("inst", time.Minute)
+
+	clock.Advance(5 * time.Second)
+	if err := c.ProcessTimeouts(); err != nil {
+		t.Fatalf("ProcessTimeouts: %v", err)
+	}
+	st, _ := c.Status("inst")
+	if st.State != StateActive || st.ActiveSessions != 1 {
+		t.Fatalf("status after expiry = %+v", st)
+	}
+	if len(st.Sessions) != 1 || st.Sessions[0].SessionID != l2.SessionID {
+		t.Fatalf("remaining sessions = %+v, want only %s", st.Sessions, l2.SessionID)
+	}
+	if comps := c.Completions(); len(comps) != 0 {
+		t.Fatalf("unexpected completions: %+v", comps)
+	}
+
+	// A late close for the expired lease is ignored; the instance still
+	// accepts new sessions.
+	if err := c.CloseSession("inst", l1.SessionID, l1.Version); !errors.Is(err, ErrLeaseUnknown) {
+		t.Fatalf("close expired lease = %v, want ErrLeaseUnknown", err)
+	}
+	if _, err := c.AcquireSession("inst", time.Minute); err != nil {
+		t.Fatalf("AcquireSession after expiry: %v", err)
+	}
+	if st, _ := c.Status("inst"); st.ActiveSessions != 2 {
+		t.Fatalf("active sessions = %d, want 2", st.ActiveSessions)
+	}
+}
+
 func TestCancelDrain(t *testing.T) {
 	c, _ := newTestCoordinator(t)
 	_ = c.Register("inst")
