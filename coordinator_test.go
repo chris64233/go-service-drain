@@ -96,8 +96,11 @@ func TestInvalidArguments(t *testing.T) {
 	if _, err := c.AcquireSession("inst", 0); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("ttl=0: %v", err)
 	}
-	if _, _, err := c.BeginDrain("inst", 0); !errors.Is(err, ErrInvalidArgument) {
+	if _, _, err := c.BeginDrain("inst", "d1", 0); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("forceAfter=0: %v", err)
+	}
+	if _, _, err := c.BeginDrain("inst", "", time.Minute); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("empty drain id: %v", err)
 	}
 	lease, _ := c.AcquireSession("inst", time.Second)
 	if _, err := c.Heartbeat("inst", lease.SessionID, lease.Version, -1); !errors.Is(err, ErrInvalidArgument) {
@@ -114,7 +117,7 @@ func TestGracefulDrainNaturalCompletion(t *testing.T) {
 	l1, _ := c.AcquireSession("inst", time.Minute)
 	l2, _ := c.AcquireSession("inst", time.Minute)
 
-	version, deadline, err := c.BeginDrain("inst", 30*time.Second)
+	version, deadline, err := c.BeginDrain("inst", "drain-1", 30*time.Second)
 	if err != nil {
 		t.Fatalf("BeginDrain: %v", err)
 	}
@@ -198,7 +201,7 @@ func TestGracefulDrainNaturalCompletion(t *testing.T) {
 func TestBeginDrainWithNoSessionsCompletesImmediately(t *testing.T) {
 	c, _ := newTestCoordinator(t)
 	_ = c.Register("inst")
-	version, _, err := c.BeginDrain("inst", time.Minute)
+	version, _, err := c.BeginDrain("inst", "drain-1", time.Minute)
 	if err != nil {
 		t.Fatalf("BeginDrain: %v", err)
 	}
@@ -220,7 +223,7 @@ func TestForceTerminationAtDeadline(t *testing.T) {
 	_ = c.Register("inst")
 	l1, _ := c.AcquireSession("inst", 10*time.Minute) // lease outlives force deadline
 	l2, _ := c.AcquireSession("inst", 5*time.Second)  // lease expires on its own
-	version, deadline, _ := c.BeginDrain("inst", time.Minute)
+	version, deadline, _ := c.BeginDrain("inst", "drain-1", time.Minute)
 
 	// Before the force deadline, nothing is forced.
 	clock.Advance(59 * time.Second)
@@ -286,7 +289,7 @@ func TestLeaseExpiryCompletesDrainNaturally(t *testing.T) {
 	c, clock := newTestCoordinator(t)
 	_ = c.Register("inst")
 	l, _ := c.AcquireSession("inst", 10*time.Second)
-	_, _, _ = c.BeginDrain("inst", time.Minute)
+	_, _, _ = c.BeginDrain("inst", "drain-1", time.Minute)
 
 	clock.Advance(10 * time.Second)
 	if err := c.ProcessTimeouts(); err != nil {
@@ -333,7 +336,7 @@ func TestCancelDrain(t *testing.T) {
 	_ = c.Register("inst")
 	l, _ := c.AcquireSession("inst", time.Minute)
 
-	version, _, err := c.BeginDrain("inst", time.Minute)
+	version, _, err := c.BeginDrain("inst", "drain-1", time.Minute)
 	if err != nil {
 		t.Fatalf("BeginDrain: %v", err)
 	}
@@ -386,14 +389,14 @@ func TestLateCancelCannotUndoNewerDrain(t *testing.T) {
 	l, _ := c.AcquireSession("inst", time.Minute)
 
 	// Drain v1, cancel, drain v2, complete naturally.
-	v1, _, _ := c.BeginDrain("inst", time.Minute)
+	v1, _, _ := c.BeginDrain("inst", "drain-1", time.Minute)
 	if err := c.CancelDrain("inst", v1); err != nil {
 		t.Fatalf("CancelDrain v1: %v", err)
 	}
 	if err := c.CloseSession("inst", l.SessionID, v1); err != nil { // v1 after cancel == current
 		t.Fatalf("CloseSession: %v", err)
 	}
-	if _, _, err := c.BeginDrain("inst", time.Minute); err != nil {
+	if _, _, err := c.BeginDrain("inst", "drain-2", time.Minute); err != nil {
 		t.Fatalf("BeginDrain v2: %v", err)
 	}
 	// no sessions -> completes immediately and permanently
@@ -420,11 +423,11 @@ func TestRedrainVersionAdvances(t *testing.T) {
 	_ = c.Register("inst")
 	l, _ := c.AcquireSession("inst", time.Minute) // acquired under v0
 
-	v1, _, _ := c.BeginDrain("inst", time.Minute) // adopts session to v1
+	v1, _, _ := c.BeginDrain("inst", "drain-1", time.Minute) // adopts session to v1
 	if err := c.CancelDrain("inst", v1); err != nil {
 		t.Fatal(err)
 	}
-	v2, _, err := c.BeginDrain("inst", time.Minute) // adopts to v2
+	v2, _, err := c.BeginDrain("inst", "drain-2", time.Minute) // adopts to v2
 	if err != nil {
 		t.Fatalf("second BeginDrain: %v", err)
 	}
@@ -469,7 +472,7 @@ func TestConcurrentCloseVersusForceTimeout(t *testing.T) {
 			}
 			leases[i] = l
 		}
-		version, deadline, err := c.BeginDrain(id, time.Minute)
+		version, deadline, err := c.BeginDrain(id, "drain-1", time.Minute)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -577,7 +580,7 @@ func TestFileJournalRecovery(t *testing.T) {
 	_ = c1.Register("inst")
 	l1, _ := c1.AcquireSession("inst", 10*time.Minute)
 	l2, _ := c1.AcquireSession("inst", 10*time.Second)
-	v1, deadline, _ := c1.BeginDrain("inst", time.Minute)
+	v1, deadline, _ := c1.BeginDrain("inst", "drain-1", time.Minute)
 	// Heartbeat l1 under the adopted version.
 	if _, err := c1.Heartbeat("inst", l1.SessionID, v1, time.Hour); err != nil {
 		t.Fatalf("Heartbeat: %v", err)
@@ -615,6 +618,13 @@ func TestFileJournalRecovery(t *testing.T) {
 	comps := c2.Completions()
 	if len(comps) != 1 || comps[0].Reason != ReasonDrained || comps[0].DrainID != 1 {
 		t.Fatalf("recovered completions = %+v", comps)
+	}
+	// The drain task record survives recovery with its snapshot.
+	if len(st2.Drains) != 1 || st2.Drains[0].State != TaskDrained || st2.Drains[0].DrainID != "drain-1" {
+		t.Fatalf("recovered drain tasks = %+v", st2.Drains)
+	}
+	if got := len(st2.Drains[0].Snapshot); got != 2 {
+		t.Fatalf("recovered snapshot size = %d, want 2", got)
 	}
 	// l2 must not appear terminated; it expired naturally.
 	if len(comps[0].Terminated) != 0 {
@@ -658,7 +668,7 @@ func TestFileJournalReplayForcedDrain(t *testing.T) {
 		defer j.Close()
 		_ = c.Register("inst")
 		_, _ = c.AcquireSession("inst", 24*time.Hour) // outlives the force deadline
-		_, _, _ = c.BeginDrain("inst", time.Minute)
+		_, _, _ = c.BeginDrain("inst", "drain-1", time.Minute)
 		if err := c.ProcessTimeouts(); err != nil { // before deadline: nothing
 			t.Fatal(err)
 		}
@@ -697,7 +707,7 @@ func TestCancelThenReopenJournal(t *testing.T) {
 	}
 	_ = c1.Register("inst")
 	_, _ = c1.AcquireSession("inst", time.Hour)
-	v, _, _ := c1.BeginDrain("inst", time.Hour)
+	v, _, _ := c1.BeginDrain("inst", "drain-1", time.Hour)
 	if err := c1.CancelDrain("inst", v); err != nil {
 		t.Fatal(err)
 	}
@@ -717,7 +727,298 @@ func TestCancelThenReopenJournal(t *testing.T) {
 	if len(c2.Completions()) != 0 {
 		t.Fatal("canceled drain must not produce a completion")
 	}
+	if len(st.Drains) != 1 || st.Drains[0].State != TaskCancelled {
+		t.Fatalf("recovered drain tasks after cancel = %+v", st.Drains)
+	}
 	if _, err := c2.AcquireSession("inst", time.Hour); err != nil {
 		t.Fatalf("AcquireSession after recovery: %v", err)
+	}
+}
+
+// Resubmitting the same drain id returns the original result; changing the
+// instance or the wait window under the same id is a conflict.
+func TestDuplicateDrainSubmission(t *testing.T) {
+	c, clock := newTestCoordinator(t)
+	_ = c.Register("inst")
+	_ = c.Register("inst-2")
+	_, _ = c.AcquireSession("inst", time.Minute)
+
+	v1, d1, err := c.BeginDrain("inst", "drain-1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("BeginDrain: %v", err)
+	}
+
+	// Identical resubmission: original result, no new task, no state change.
+	v2, d2, err := c.BeginDrain("inst", "drain-1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("duplicate BeginDrain: %v", err)
+	}
+	if v2 != v1 || !d2.Equal(d1) {
+		t.Fatalf("duplicate = (v%d, %v), want (v%d, %v)", v2, d2, v1, d1)
+	}
+	st, _ := c.Status("inst")
+	if st.Version != 1 || len(st.Drains) != 1 {
+		t.Fatalf("duplicate submission changed state: %+v", st)
+	}
+
+	// Same id, different wait window or instance: conflict.
+	if _, _, err := c.BeginDrain("inst", "drain-1", time.Minute); !errors.Is(err, ErrDrainConflict) {
+		t.Fatalf("different wait window = %v, want ErrDrainConflict", err)
+	}
+	if _, _, err := c.BeginDrain("inst-2", "drain-1", 30*time.Second); !errors.Is(err, ErrDrainConflict) {
+		t.Fatalf("different instance = %v, want ErrDrainConflict", err)
+	}
+
+	// Even after the drain finished, resubmission returns the original
+	// result instead of starting a new drain.
+	clock.Advance(31 * time.Second)
+	if err := c.ProcessTimeouts(); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := c.Status("inst"); st.State != StateDrained {
+		t.Fatalf("state = %s, want drained", st.State)
+	}
+	v3, d3, err := c.BeginDrain("inst", "drain-1", 30*time.Second)
+	if err != nil || v3 != v1 || !d3.Equal(d1) {
+		t.Fatalf("resubmit after finish = (v%d, %v, %v)", v3, d3, err)
+	}
+	if st, _ := c.Status("inst"); len(st.Drains) != 1 {
+		t.Fatalf("resubmit created a new task: %+v", st.Drains)
+	}
+}
+
+// New requests racing with the start of a drain must never slip into the
+// draining instance: every acquire either landed before the drain (and was
+// adopted) or was rejected.
+func TestNewRequestRaceWithDrain(t *testing.T) {
+	const iterations = 100
+	for iter := 0; iter < iterations; iter++ {
+		c, _ := newTestCoordinator(t)
+		id := fmt.Sprintf("inst-%d", iter)
+		if err := c.Register(id); err != nil {
+			t.Fatal(err)
+		}
+		// An anchor session keeps the drain in progress regardless of how
+		// the race interleaves.
+		if _, err := c.AcquireSession(id, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+
+		const n = 16
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var acquired []Lease
+		rejected := 0
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				l, err := c.AcquireSession(id, time.Minute)
+				mu.Lock()
+				defer mu.Unlock()
+				if err == nil {
+					acquired = append(acquired, l)
+				} else if errors.Is(err, ErrInstanceDraining) || errors.Is(err, ErrInstanceDrained) {
+					rejected++
+				} else {
+					t.Errorf("unexpected acquire error: %v", err)
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = c.BeginDrain(id, "drain-1", time.Minute)
+		}()
+		wg.Wait()
+
+		st, err := c.Status(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.State != StateDraining {
+			t.Fatalf("iter %d: state = %s, want draining", iter, st.State)
+		}
+		if st.Accepting || st.BlockedReason != BlockedDraining {
+			t.Fatalf("iter %d: accepting=%v blocked=%q", iter, st.Accepting, st.BlockedReason)
+		}
+		if len(acquired)+rejected != n {
+			t.Fatalf("iter %d: acquired %d + rejected %d != %d", iter, len(acquired), rejected, n)
+		}
+		// Every session that got in before the drain was adopted to the
+		// drain version; none entered afterwards.
+		if st.ActiveSessions != len(acquired)+1 {
+			t.Fatalf("iter %d: active = %d, acquired = %d (+1 anchor)", iter, st.ActiveSessions, len(acquired))
+		}
+		for _, s := range st.Sessions {
+			if s.Version != st.Version {
+				t.Fatalf("iter %d: session %s at version %d, want %d", iter, s.SessionID, s.Version, st.Version)
+			}
+		}
+		// The drain task snapshot matches the connections that were in
+		// flight when the drain began.
+		if len(st.Drains) != 1 || len(st.Drains[0].Snapshot) != st.ActiveSessions {
+			t.Fatalf("iter %d: snapshot = %+v, active = %d", iter, st.Drains, st.ActiveSessions)
+		}
+	}
+}
+
+// A drain that times out must record every leftover connection individually
+// with its reason, on both the completion and the drain task history.
+func TestTimeoutRecordsEachUnfinishedConnection(t *testing.T) {
+	c, clock := newTestCoordinator(t)
+	_ = c.Register("inst")
+	l1, _ := c.AcquireSession("inst", time.Hour)
+	l2, _ := c.AcquireSession("inst", time.Hour)
+	l3, _ := c.AcquireSession("inst", time.Hour)
+	version, deadline, _ := c.BeginDrain("inst", "drain-1", time.Minute)
+
+	// One connection finishes in time; two remain open at the deadline.
+	if err := c.CloseSession("inst", l1.SessionID, version); err != nil {
+		t.Fatal(err)
+	}
+	clock.Set(deadline)
+	if err := c.ProcessTimeouts(); err != nil {
+		t.Fatal(err)
+	}
+
+	comps := c.Completions()
+	if len(comps) != 1 || comps[0].Reason != ReasonForced {
+		t.Fatalf("completions = %+v", comps)
+	}
+	terminated := map[string]TerminatedSession{}
+	for _, term := range comps[0].Terminated {
+		terminated[term.SessionID] = term
+	}
+	if len(terminated) != 2 {
+		t.Fatalf("terminated = %+v, want 2 entries", comps[0].Terminated)
+	}
+	for _, id := range []string{l2.SessionID, l3.SessionID} {
+		term, ok := terminated[id]
+		if !ok {
+			t.Fatalf("session %s missing from terminated list", id)
+		}
+		if term.Reason != ReasonForceTimeout {
+			t.Fatalf("session %s reason = %q, want %q", id, term.Reason, ReasonForceTimeout)
+		}
+	}
+	if _, ok := terminated[l1.SessionID]; ok {
+		t.Fatalf("closed session %s recorded as terminated", l1.SessionID)
+	}
+
+	// The drain task history shows the same per-connection detail and must
+	// not present the instance as cleanly drained.
+	st, _ := c.Status("inst")
+	if st.State != StateDrained || st.Accepting || st.BlockedReason != BlockedDrained {
+		t.Fatalf("status = %+v", st)
+	}
+	if len(st.Drains) != 1 {
+		t.Fatalf("drains = %+v", st.Drains)
+	}
+	task := st.Drains[0]
+	if task.State != TaskTimedOut {
+		t.Fatalf("task state = %q, want %q", task.State, TaskTimedOut)
+	}
+	if len(task.Snapshot) != 3 {
+		t.Fatalf("snapshot = %+v, want 3 connections", task.Snapshot)
+	}
+	if len(task.Terminated) != 2 {
+		t.Fatalf("task terminated = %+v, want 2", task.Terminated)
+	}
+	for _, term := range task.Terminated {
+		if term.Reason != ReasonForceTimeout {
+			t.Fatalf("task terminated reason = %q", term.Reason)
+		}
+	}
+	if task.StartedAt.IsZero() || task.MaxWait != time.Minute || !task.Deadline.Equal(deadline) {
+		t.Fatalf("task window = %+v", task)
+	}
+	if task.FinishedAt.IsZero() {
+		t.Fatal("task FinishedAt not set")
+	}
+}
+
+// Accepted connections can be moved into an explicit transferred state
+// during a drain; the transfer is recorded and ends the lease.
+func TestTransferSessionDuringDrain(t *testing.T) {
+	c, _ := newTestCoordinator(t)
+	_ = c.Register("inst")
+	l1, _ := c.AcquireSession("inst", time.Minute)
+	l2, _ := c.AcquireSession("inst", time.Minute)
+	version, _, _ := c.BeginDrain("inst", "drain-1", time.Minute)
+
+	if err := c.TransferSession("inst", l1.SessionID, version, ""); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("empty target = %v, want ErrInvalidArgument", err)
+	}
+	// Stale version cannot transfer.
+	if err := c.TransferSession("inst", l1.SessionID, 0, "inst-2"); !errors.Is(err, ErrVersionMismatch) {
+		t.Fatalf("stale transfer = %v, want ErrVersionMismatch", err)
+	}
+	if err := c.TransferSession("inst", l1.SessionID, version, "inst-2"); err != nil {
+		t.Fatalf("TransferSession: %v", err)
+	}
+	st, _ := c.Status("inst")
+	if st.ActiveSessions != 1 || st.State != StateDraining {
+		t.Fatalf("after transfer: %+v", st)
+	}
+	if len(st.Transfers) != 1 || st.Transfers[0].SessionID != l1.SessionID || st.Transfers[0].Target != "inst-2" {
+		t.Fatalf("transfers = %+v", st.Transfers)
+	}
+	// The transferred lease is gone: heartbeat, close and re-transfer all
+	// fail as unknown.
+	if _, err := c.Heartbeat("inst", l1.SessionID, version, time.Minute); !errors.Is(err, ErrLeaseUnknown) {
+		t.Fatalf("heartbeat transferred = %v, want ErrLeaseUnknown", err)
+	}
+	if err := c.TransferSession("inst", l1.SessionID, version, "inst-3"); !errors.Is(err, ErrLeaseUnknown) {
+		t.Fatalf("re-transfer = %v, want ErrLeaseUnknown", err)
+	}
+
+	// Transferring the last session completes the drain naturally.
+	if err := c.TransferSession("inst", l2.SessionID, version, "inst-2"); err != nil {
+		t.Fatalf("TransferSession l2: %v", err)
+	}
+	st, _ = c.Status("inst")
+	if st.State != StateDrained || st.ActiveSessions != 0 {
+		t.Fatalf("after last transfer: %+v", st)
+	}
+	comps := c.Completions()
+	if len(comps) != 1 || comps[0].Reason != ReasonDrained {
+		t.Fatalf("completions = %+v", comps)
+	}
+	if len(st.Drains) != 1 || st.Drains[0].State != TaskDrained {
+		t.Fatalf("task = %+v", st.Drains)
+	}
+	if got := len(st.Drains[0].Transfers); got != 2 {
+		t.Fatalf("task transfers = %d, want 2", got)
+	}
+}
+
+// A cancelled drain returns the instance to active, but the task record —
+// including its connection snapshot — is retained and queryable.
+func TestCancelDrainRetainsTaskRecord(t *testing.T) {
+	c, _ := newTestCoordinator(t)
+	_ = c.Register("inst")
+	l, _ := c.AcquireSession("inst", time.Minute)
+	version, _, _ := c.BeginDrain("inst", "drain-1", time.Minute)
+
+	if err := c.CancelDrain("inst", version); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := c.Status("inst")
+	if st.State != StateActive || !st.Accepting || st.BlockedReason != "" {
+		t.Fatalf("status after cancel = %+v", st)
+	}
+	if len(st.Drains) != 1 {
+		t.Fatalf("drain record lost after cancel: %+v", st.Drains)
+	}
+	task := st.Drains[0]
+	if task.State != TaskCancelled || task.DrainID != "drain-1" || task.Version != version {
+		t.Fatalf("cancelled task = %+v", task)
+	}
+	if len(task.Snapshot) != 1 || task.Snapshot[0].SessionID != l.SessionID {
+		t.Fatalf("cancelled task snapshot = %+v", task.Snapshot)
+	}
+	if task.FinishedAt.IsZero() {
+		t.Fatal("cancelled task FinishedAt not set")
 	}
 }

@@ -8,6 +8,11 @@
 // Every BeginDrain produces a new, monotonically increasing version and stops
 // the instance from acquiring new sessions; sessions already established are
 // adopted by the new version and may finish before the force deadline.
+// Each drain is recorded as a task (start time, maximum wait window and the
+// connection snapshot at creation) that is kept forever, even after a
+// cancel. Accepted connections can only end (close/expiry/forced
+// termination, each recorded) or move into an explicit transferred state.
+// BeginDrain is idempotent on its client-supplied drain id.
 // Heartbeats, closes and lease expirations only affect a session when the
 // carried version matches the instance's current version and the lease still
 // exists, so duplicate and out-of-order messages from an old drain version
@@ -38,6 +43,35 @@ type instance struct {
 	version       int64
 	sessions      map[string]*session
 	drainDeadline time.Time // zero unless state == draining
+	tasks         []*drainTask
+	transfers     []TransferRecord
+}
+
+// drainTask is the recorded history of one drain. Tasks are never removed:
+// even a cancelled drain keeps its snapshot so the instance can never revert
+// to plain "available" while losing the drain record.
+type drainTask struct {
+	id         string
+	instanceID string
+	version    int64
+	startedAt  time.Time
+	maxWait    time.Duration
+	deadline   time.Time
+	state      string
+	snapshot   []SessionSnapshot
+	terminated []TerminatedSession
+	transfers  []TransferRecord
+	finishedAt time.Time
+}
+
+// openTask returns the instance's in-progress drain task, or nil.
+func (inst *instance) openTask() *drainTask {
+	for i := len(inst.tasks) - 1; i >= 0; i-- {
+		if inst.tasks[i].state == TaskDraining {
+			return inst.tasks[i]
+		}
+	}
+	return nil
 }
 
 // Coordinator serializes all drain coordination for a set of instances. Its
@@ -50,6 +84,7 @@ type Coordinator struct {
 	seq         int64
 	counter     uint64
 	insts       map[string]*instance
+	tasksByID   map[string]*drainTask
 	completions []Completion
 }
 
@@ -57,9 +92,10 @@ type Coordinator struct {
 // and seeded with whatever the journal already contains.
 func NewCoordinator(journal Journal) (*Coordinator, error) {
 	c := &Coordinator{
-		clock:   SystemClock(),
-		journal: journal,
-		insts:   make(map[string]*instance),
+		clock:     SystemClock(),
+		journal:   journal,
+		insts:     make(map[string]*instance),
+		tasksByID: make(map[string]*drainTask),
 	}
 	if err := c.replay(); err != nil {
 		return nil, err
@@ -74,9 +110,10 @@ func NewEphemeral(clock Clock) *Coordinator {
 		clock = SystemClock()
 	}
 	c := &Coordinator{
-		clock:   clock,
-		journal: newMemJournal(),
-		insts:   make(map[string]*instance),
+		clock:     clock,
+		journal:   newMemJournal(),
+		insts:     make(map[string]*instance),
+		tasksByID: make(map[string]*drainTask),
 	}
 	return c
 }
@@ -300,6 +337,56 @@ func (c *Coordinator) CloseSession(instanceID, sessionID string, version int64) 
 	return c.commit(changes...)
 }
 
+// TransferSession moves one accepted session off the instance into an
+// explicit transferred state instead of closing it in place. The transfer is
+// recorded on the instance and on the in-progress drain task (if any), and
+// the session lease ends immediately: later heartbeats or closes for it are
+// rejected as unknown. Version rules match CloseSession. When the last
+// session of a draining instance is transferred, the drain completes
+// naturally in the same committed batch.
+func (c *Coordinator) TransferSession(instanceID, sessionID string, version int64, target string) error {
+	if target == "" {
+		return ErrInvalidArgument
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	inst, err := c.instance(instanceID)
+	if err != nil {
+		return err
+	}
+	if _, err := lookupSession(inst, sessionID, version); err != nil {
+		return err
+	}
+
+	rec := TransferRecord{
+		SessionID: sessionID,
+		Version:   version,
+		Target:    target,
+		At:        c.clock.Now(),
+	}
+	changes := []journaledChange{{
+		kind: kindSessionMoved,
+		payload: &evSessionTransferred{
+			InstanceID: instanceID,
+			SessionID:  sessionID,
+			Version:    version,
+			Target:     target,
+		},
+		apply: func() {
+			delete(inst.sessions, sessionID)
+			inst.transfers = append(inst.transfers, rec)
+			if task := inst.openTask(); task != nil {
+				task.transfers = append(task.transfers, rec)
+			}
+		},
+	}}
+	if inst.state == StateDraining && len(inst.sessions) == 1 {
+		changes = append(changes, c.naturalCompletionChange(inst))
+	}
+	return c.commit(changes...)
+}
+
 // naturalCompletionChange builds the drain_completed change (reason drained)
 // and its state transition. The caller must hold c.mu and have already
 // established that the session map will be empty once the batch applies.
@@ -322,6 +409,10 @@ func (c *Coordinator) naturalCompletionChange(inst *instance) journaledChange {
 				Reason:     ReasonDrained,
 				At:         at,
 			})
+			if task := inst.openTask(); task != nil {
+				task.state = TaskDrained
+				task.finishedAt = at
+			}
 		},
 	}
 }
@@ -339,12 +430,29 @@ func (c *Coordinator) applyCompletion(inst *instance, comp Completion) {
 // the new version so that carries of the old version become stale. Sessions
 // may finish naturally until now+forceAfter; at that point ProcessTimeouts
 // terminates the rest. With no active sessions the drain completes at once.
-func (c *Coordinator) BeginDrain(instanceID string, forceAfter time.Duration) (version int64, deadline time.Time, err error) {
-	if forceAfter <= 0 {
+//
+// drainID is a client-supplied idempotency key: resubmitting the same
+// drainID with the same instance and wait window returns the original
+// version and deadline without creating a new drain, even if the first
+// drain has already finished. Reusing the drainID with a different instance
+// or wait window fails with ErrDrainConflict.
+//
+// Every call records a drain task (start time, wait window, connection
+// snapshot) that is kept for the life of the instance, including after a
+// cancel.
+func (c *Coordinator) BeginDrain(instanceID, drainID string, forceAfter time.Duration) (version int64, deadline time.Time, err error) {
+	if drainID == "" || forceAfter <= 0 {
 		return 0, time.Time{}, ErrInvalidArgument
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if task, ok := c.tasksByID[drainID]; ok {
+		if task.instanceID != instanceID || task.maxWait != forceAfter {
+			return 0, time.Time{}, ErrDrainConflict
+		}
+		return task.version, task.deadline, nil
+	}
 
 	inst, err := c.instance(instanceID)
 	if err != nil {
@@ -358,7 +466,8 @@ func (c *Coordinator) BeginDrain(instanceID string, forceAfter time.Duration) (v
 	}
 
 	newVersion := inst.version + 1
-	deadline = c.clock.Now().Add(forceAfter)
+	startedAt := c.clock.Now()
+	deadline = startedAt.Add(forceAfter)
 	adopted := make(map[string]int64, len(inst.sessions))
 	ids := make([]string, 0, len(inst.sessions))
 	for id := range inst.sessions {
@@ -366,14 +475,36 @@ func (c *Coordinator) BeginDrain(instanceID string, forceAfter time.Duration) (v
 		ids = append(ids, id)
 	}
 	sort.Strings(ids) // deterministic journal content
+	snapshot := make([]SessionSnapshot, 0, len(ids))
+	for _, id := range ids {
+		snapshot = append(snapshot, SessionSnapshot{
+			SessionID: id,
+			Version:   newVersion,
+			Deadline:  inst.sessions[id].deadline,
+		})
+	}
+	task := &drainTask{
+		id:         drainID,
+		instanceID: instanceID,
+		version:    newVersion,
+		startedAt:  startedAt,
+		maxWait:    forceAfter,
+		deadline:   deadline,
+		state:      TaskDraining,
+		snapshot:   snapshot,
+	}
 
 	changes := []journaledChange{{
 		kind: kindDrainBegan,
 		payload: &evDrainBegan{
 			InstanceID:      instanceID,
+			DrainID:         drainID,
 			Version:         newVersion,
+			StartedAt:       startedAt,
+			MaxWait:         forceAfter,
 			Deadline:        deadline,
 			SessionVersions: adopted,
+			Snapshot:        snapshot,
 		},
 		apply: func() {
 			inst.version = newVersion
@@ -382,6 +513,8 @@ func (c *Coordinator) BeginDrain(instanceID string, forceAfter time.Duration) (v
 			for _, sess := range inst.sessions {
 				sess.version = newVersion
 			}
+			inst.tasks = append(inst.tasks, task)
+			c.tasksByID[drainID] = task
 		},
 	}}
 	if len(ids) == 0 {
@@ -393,11 +526,13 @@ func (c *Coordinator) BeginDrain(instanceID string, forceAfter time.Duration) (v
 	return newVersion, deadline, nil
 }
 
-// CancelDrain aborts a drain and resumes accepting new sessions. The caller
-// must present the current drain version; a late cancel carrying an old
-// version is rejected (ErrVersionMismatch), as are cancels against an
-// instance that is active (ErrNoDrainInProgress) or already drained
-// (ErrInstanceDrained).
+// CancelDrain aborts an in-progress drain and resumes accepting new
+// sessions. The caller must present the current drain version; a late cancel
+// carrying an old version is rejected (ErrVersionMismatch), as are cancels
+// against an instance that is active (ErrNoDrainInProgress) or already
+// drained (ErrInstanceDrained) — a completed or timed-out drain can never be
+// resurrected by a stale cancel. The cancelled drain task, including its
+// connection snapshot, stays in the instance's drain history.
 func (c *Coordinator) CancelDrain(instanceID string, version int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -415,12 +550,17 @@ func (c *Coordinator) CancelDrain(instanceID string, version int64) error {
 	if inst.version != version {
 		return ErrVersionMismatch
 	}
+	cancelledAt := c.clock.Now()
 	return c.commit(journaledChange{
 		kind:    kindDrainCanceled,
 		payload: &evDrainCanceled{InstanceID: instanceID, Version: version},
 		apply: func() {
 			inst.state = StateActive
 			inst.drainDeadline = time.Time{}
+			if task := inst.openTask(); task != nil {
+				task.state = TaskCancelled
+				task.finishedAt = cancelledAt
+			}
 		},
 	})
 }
@@ -518,6 +658,7 @@ func (c *Coordinator) advanceLocked(now time.Time) error {
 				records = append(records, TerminatedSession{
 					SessionID: sid,
 					Version:   inst.sessions[sid].version,
+					Reason:    ReasonForceTimeout,
 				})
 			}
 
@@ -555,6 +696,11 @@ func (c *Coordinator) advanceLocked(now time.Time) error {
 							Terminated: killedCopy,
 							At:         at,
 						})
+						if task := inst.openTask(); task != nil {
+							task.state = TaskTimedOut
+							task.terminated = append([]TerminatedSession(nil), killedCopy...)
+							task.finishedAt = at
+						}
 					},
 				},
 			)
@@ -594,11 +740,32 @@ func (c *Coordinator) Status(instanceID string) (Status, error) {
 		State:          inst.state,
 		Version:        inst.version,
 		ActiveSessions: len(inst.sessions),
+		Accepting:      inst.state == StateActive,
 		Sessions:       sessions,
 	}
-	if inst.state == StateDraining {
+	switch inst.state {
+	case StateDraining:
 		st.Drain = &DrainInfo{Version: inst.version, Deadline: inst.drainDeadline}
+		st.BlockedReason = BlockedDraining
+	case StateDrained:
+		st.BlockedReason = BlockedDrained
 	}
+	st.Drains = make([]DrainTaskInfo, 0, len(inst.tasks))
+	for _, task := range inst.tasks {
+		st.Drains = append(st.Drains, DrainTaskInfo{
+			DrainID:    task.id,
+			Version:    task.version,
+			State:      task.state,
+			StartedAt:  task.startedAt,
+			MaxWait:    task.maxWait,
+			Deadline:   task.deadline,
+			FinishedAt: task.finishedAt,
+			Snapshot:   append([]SessionSnapshot(nil), task.snapshot...),
+			Terminated: append([]TerminatedSession(nil), task.terminated...),
+			Transfers:  append([]TransferRecord(nil), task.transfers...),
+		})
+	}
+	st.Transfers = append([]TransferRecord(nil), inst.transfers...)
 	return st, nil
 }
 
@@ -676,6 +843,18 @@ func (c *Coordinator) replay() error {
 					sess.version = v
 				}
 			}
+			task := &drainTask{
+				id:         p.DrainID,
+				instanceID: p.InstanceID,
+				version:    p.Version,
+				startedAt:  p.StartedAt,
+				maxWait:    p.MaxWait,
+				deadline:   p.Deadline,
+				state:      TaskDraining,
+				snapshot:   append([]SessionSnapshot(nil), p.Snapshot...),
+			}
+			inst.tasks = append(inst.tasks, task)
+			c.tasksByID[p.DrainID] = task
 
 		case *evDrainCanceled:
 			inst, err := c.instance(p.InstanceID)
@@ -684,6 +863,27 @@ func (c *Coordinator) replay() error {
 			}
 			inst.state = StateActive
 			inst.drainDeadline = time.Time{}
+			if task := inst.openTask(); task != nil && task.version == p.Version {
+				task.state = TaskCancelled
+				task.finishedAt = e.At
+			}
+
+		case *evSessionTransferred:
+			inst, err := c.instance(p.InstanceID)
+			if err != nil {
+				return &CorruptJournalError{Seq: e.Seq, Reason: err.Error()}
+			}
+			delete(inst.sessions, p.SessionID)
+			rec := TransferRecord{
+				SessionID: p.SessionID,
+				Version:   p.Version,
+				Target:    p.Target,
+				At:        e.At,
+			}
+			inst.transfers = append(inst.transfers, rec)
+			if task := inst.openTask(); task != nil {
+				task.transfers = append(task.transfers, rec)
+			}
 
 		case *evSessionsKilled:
 			inst, err := c.instance(p.InstanceID)
@@ -709,6 +909,15 @@ func (c *Coordinator) replay() error {
 				Terminated: terminated,
 				At:         p.At,
 			})
+			if task := inst.openTask(); task != nil && task.version == p.DrainID {
+				if p.Reason == ReasonForced {
+					task.state = TaskTimedOut
+					task.terminated = terminated
+				} else {
+					task.state = TaskDrained
+				}
+				task.finishedAt = p.At
+			}
 
 		default:
 			return &CorruptJournalError{Seq: e.Seq, Reason: "unhandled event payload"}

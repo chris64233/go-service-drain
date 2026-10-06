@@ -28,6 +28,10 @@ var (
 	// ErrNoDrainInProgress is returned by CancelDrain when the instance is not
 	// currently draining (active, or drain already finished).
 	ErrNoDrainInProgress = errors.New("goservicedrain: no drain in progress")
+	// ErrDrainConflict is returned by BeginDrain when the supplied drain id
+	// was already used with a different instance or wait window. Reusing a
+	// drain id with identical parameters returns the original result.
+	ErrDrainConflict = errors.New("goservicedrain: drain id already used with different parameters")
 	// ErrInvalidArgument is returned for zero or negative durations and other
 	// malformed inputs.
 	ErrInvalidArgument = errors.New("goservicedrain: invalid argument")
