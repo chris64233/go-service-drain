@@ -31,6 +31,7 @@ const (
 	kindSessionExpired = "session_expired"
 	kindDrainBegan     = "drain_began"
 	kindDrainCanceled  = "drain_canceled"
+	kindSessionMoved   = "session_transferred"
 	kindSessionsKilled = "sessions_terminated"
 	kindDrainCompleted = "drain_completed"
 )
@@ -72,16 +73,30 @@ type evSessionEnded struct {
 
 type evDrainBegan struct {
 	InstanceID string
-	Version    int64
-	Deadline   time.Time
+	// DrainID is the client-supplied idempotency key of the drain task.
+	DrainID   string
+	Version   int64
+	StartedAt time.Time
+	// MaxWait is the maximum wait window granted to in-flight sessions.
+	MaxWait  time.Duration
+	Deadline time.Time
 	// SessionVersions pins every in-flight session to the new drain version
 	// at adoption time.
 	SessionVersions map[string]int64
+	// Snapshot is the connection snapshot recorded on the drain task.
+	Snapshot []SessionSnapshot
 }
 
 type evDrainCanceled struct {
 	InstanceID string
 	Version    int64
+}
+
+type evSessionTransferred struct {
+	InstanceID string
+	SessionID  string
+	Version    int64
+	Target     string
 }
 
 type evSessionsKilled struct {
@@ -114,6 +129,8 @@ func payloadByKind(kind string) any {
 		return new(evDrainBegan)
 	case kindDrainCanceled:
 		return new(evDrainCanceled)
+	case kindSessionMoved:
+		return new(evSessionTransferred)
 	case kindSessionsKilled:
 		return new(evSessionsKilled)
 	case kindDrainCompleted:

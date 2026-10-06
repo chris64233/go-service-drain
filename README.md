@@ -20,6 +20,37 @@
 | `draining` | 不可以（`ErrInstanceDraining`） | 摘流进行中；存量会话被新版本"认领"，可在强制截止时间前自然关闭 |
 | `drained` | 永远不可以（`ErrInstanceDrained`） | 摘流已完成（自然完成或强制终止），迟到取消不能恢复 |
 
+### 排空任务（drain task）
+
+每次 `BeginDrain` 创建一条**永不删除**的排空任务记录，包含：实例、开始时间、最大等待窗口（`forceAfter`）、强制截止时间和发起时刻的**连接快照**。即使摘流被取消、实例恢复接流，任务记录（含快照）仍保留在 `Status().Drains` 中——实例可以被重新标记为可用，但排空记录不会丢失。
+
+任务状态机（只前进、不后退）：
+
+| 任务状态 | 含义 |
+| --- | --- |
+| `draining` | 排空进行中，实例拒接新会话 |
+| `drained` | 所有连接在截止时间前结束（关闭/过期）或转移，自然完成 |
+| `timed_out` | 到达最大等待窗口仍有连接未结束，被强制终止 |
+| `cancelled` | 进行中被取消，实例恢复接流，记录保留 |
+
+**幂等提交**：`BeginDrain(instanceID, drainID, forceAfter)` 中的 `drainID` 是调用方提供的幂等键。同一 `drainID` 以相同实例和相同等待窗口重复提交时，返回首次的版本与截止时间（即使该排空已完成），不创建新任务；实例或等待窗口任一不同则返回 `ErrDrainConflict`。
+
+### 连接的最终去向
+
+排空期间，已接收连接只有三种明确去向，都会留下记录：
+
+- **结束**：`CloseSession` 正常关闭，或租约到期被 `ProcessTimeouts` 回收；
+- **转移**：`TransferSession(instance, session, version, target)` 把连接显式转移到目标实例，转移结果记入 `Status().Transfers` 和当前任务的 `Transfers`，租约立即失效（之后的心跳/关闭/再次转移一律 `ErrLeaseUnknown`）；最后一个连接被转移时排空自然完成；
+- **强制终止**：到达最大等待窗口仍未结束的连接，在超时推进时**逐项**记录到完成通知与任务的 `Terminated` 列表，每项带 `Reason`（`force_timeout`）——实例不会被笼统地标成"已完成"而掩盖未处理请求，任务状态为 `timed_out` 而非 `drained`。
+
+### 取消语义
+
+`CancelDrain` 只对**进行中**的排空生效，且必须携带当前版本：已完成（`drained`）或已超时（`timed_out`）的排空返回 `ErrInstanceDrained`，携带旧版本的迟到取消返回 `ErrVersionMismatch`——旧取消请求永远无法恢复已经结束或超时的排空。
+
+### 查询一致性
+
+`Status(instanceID)` 返回：实例状态、版本、活动连接数及明细、`Accepting`（当前是否可接新流）与 `BlockedReason`（`draining`/`drained`，可接流时为空）、完整排空任务历史 `Drains`（含快照、逐项终止原因、转移结果）和实例级转移列表 `Transfers`。`Accepting` 恒等于"状态为 active 且没有进行中的排空任务"，与上述记录保持一致。
+
 ### 版本（generation）与消息有效性
 
 - 实例登记时版本为 `0`；每次 `BeginDrain` 生成 `v+1`，每次 `CancelDrain` 不回退版本（重新发起摘流继续递增），保证版本号全局单调。
@@ -41,10 +72,11 @@
 | `AcquireSession(instanceID, ttl)` | 领取带期限的会话租约，返回 `Lease{SessionID, Version, Deadline}` |
 | `Heartbeat(instanceID, sessionID, version, ttl)` | 续租；版本/租约不匹配则拒绝 |
 | `CloseSession(instanceID, sessionID, version)` | 关闭会话；可能同时自然完成摘流 |
-| `BeginDrain(instanceID, forceAfter)` | 发起摘流，返回新版本与强制截止时间；无会话时立即完成 |
-| `CancelDrain(instanceID, version)` | 截止前取消摘流并恢复接流 |
+| `TransferSession(instanceID, sessionID, version, target)` | 把会话显式转移到目标实例并记录转移结果 |
+| `BeginDrain(instanceID, drainID, forceAfter)` | 发起摘流，返回新版本与强制截止时间；`drainID` 幂等，参数变化返回 `ErrDrainConflict`；无会话时立即完成 |
+| `CancelDrain(instanceID, version)` | 取消进行中的摘流并恢复接流；任务记录保留 |
 | `ProcessTimeouts()` | 按协调器时钟推进：租约过期、强制终止 |
-| `Status(instanceID)` | 查询状态、版本、活动会话数及租约明细 |
+| `Status(instanceID)` | 查询状态、可接收状态与阻断原因、活动会话明细、排空任务历史与转移结果 |
 
 ## 持久化
 
@@ -53,7 +85,8 @@
 ```
 instance_registered / lease_acquired / session_heartbeat
 session_closed / session_expired
-drain_began（含被认领会话→新版本的映射）/ drain_canceled
+session_transferred（含转移目标）
+drain_began（含 drainID、等待窗口、开始时间与连接快照）/ drain_canceled
 sessions_terminated / drain_completed
 ```
 
@@ -72,8 +105,8 @@ if err := coord.Register("10.0.0.1:8080"); err != nil { log.Fatal(err) }
 lease, err := coord.AcquireSession("10.0.0.1:8080", 30*time.Second)
 // ... 业务会话期间周期性 Heartbeat(instance, lease.SessionID, lease.Version, ttl)
 
-// 运维触发摘流：立即不接新流，60s 后强制终止
-version, deadline, err := coord.BeginDrain("10.0.0.1:8080", 60*time.Second)
+// 运维触发摘流：立即不接新流，60s 后强制终止；drainID 幂等
+version, deadline, err := coord.BeginDrain("10.0.0.1:8080", "drain-2026-0001", 60*time.Second)
 
 // 定时推进（或由独立 goroutine ticker 调用）
 if err := coord.ProcessTimeouts(); err != nil { log.Print(err) }
@@ -88,4 +121,4 @@ _ = coord.CancelDrain("10.0.0.1:8080", version)
 go test -race -count=1 ./...
 ```
 
-覆盖：正常生命周期、重复/乱序/旧版本消息隔离、租约过期自然完成、强制截止终止且只通知一次、取消与重复摘流版本递增、文件日志重放恢复，以及 200 轮「最后关闭 × 超时推进」并发压力（`-race`）。
+覆盖：正常生命周期、重复/乱序/旧版本消息隔离、租约过期自然完成、强制截止终止且只通知一次、取消与重复摘流版本递增、文件日志重放恢复、重复排空提交幂等与冲突、超时逐项记录未结束连接、连接转移、取消保留任务记录，以及「新请求 × 摘流开始」和 200 轮「最后关闭 × 超时推进」并发压力（`-race`）。
